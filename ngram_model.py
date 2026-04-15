@@ -2,13 +2,115 @@
 # -*- coding: utf-8 -*-
 """
 N-Gram 语言模型实现
-支持 N 可调，包含 Add-1 (Laplace) 平滑技术
+支持 N 可调，包含多种平滑技术和采样策略
 """
 
 import random
 import math
 from collections import defaultdict, Counter
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
+from abc import ABC, abstractmethod
+
+from config import (
+    ModelConfig, 
+    GenerationConfig, 
+    SmoothingMethod, 
+    SamplingStrategy,
+    LogConfig
+)
+from utils import (
+    setup_logger,
+    validate_corpus,
+    EmptyCorpusError,
+    InvalidContextError,
+    InvalidInputTypeError,
+    ModelNotTrainedError,
+    DivisionByZeroError,
+    NGramError
+)
+
+
+class BaseSmoothing(ABC):
+    """平滑方法基类"""
+    
+    @abstractmethod
+    def calculate_probability(
+        self, 
+        word: str, 
+        context: Tuple[str, ...],
+        ngram_counts: Dict[Tuple[str, ...], Counter],
+        context_counts: Counter,
+        vocab_size: int
+    ) -> float:
+        """计算平滑后的条件概率"""
+        pass
+
+
+class AddOneSmoothing(BaseSmoothing):
+    """Add-1 (Laplace) 平滑"""
+    
+    def calculate_probability(
+        self, 
+        word: str, 
+        context: Tuple[str, ...],
+        ngram_counts: Dict[Tuple[str, ...], Counter],
+        context_counts: Counter,
+        vocab_size: int
+    ) -> float:
+        count_context_word = ngram_counts[context].get(word, 0)
+        count_context = context_counts.get(context, 0)
+        return (count_context_word + 1) / (count_context + vocab_size)
+
+
+class AddKSmoothing(BaseSmoothing):
+    """Add-k 平滑"""
+    
+    def __init__(self, k: float = 0.5):
+        if k <= 0:
+            raise ValueError(f"k 值必须大于 0，当前值: {k}")
+        self.k = k
+    
+    def calculate_probability(
+        self, 
+        word: str, 
+        context: Tuple[str, ...],
+        ngram_counts: Dict[Tuple[str, ...], Counter],
+        context_counts: Counter,
+        vocab_size: int
+    ) -> float:
+        count_context_word = ngram_counts[context].get(word, 0)
+        count_context = context_counts.get(context, 0)
+        return (count_context_word + self.k) / (count_context + self.k * vocab_size)
+
+
+class NoSmoothing(BaseSmoothing):
+    """无平滑（最大似然估计）"""
+    
+    def calculate_probability(
+        self, 
+        word: str, 
+        context: Tuple[str, ...],
+        ngram_counts: Dict[Tuple[str, ...], Counter],
+        context_counts: Counter,
+        vocab_size: int
+    ) -> float:
+        count_context_word = ngram_counts[context].get(word, 0)
+        count_context = context_counts.get(context, 0)
+        if count_context == 0:
+            return 0.0
+        return count_context_word / count_context
+
+
+def get_smoothing_method(config: ModelConfig) -> BaseSmoothing:
+    """根据配置获取平滑方法实例"""
+    if config.smoothing_method == SmoothingMethod.ADD_ONE:
+        return AddOneSmoothing()
+    elif config.smoothing_method == SmoothingMethod.ADD_K:
+        return AddKSmoothing(k=config.smoothing_k)
+    elif config.smoothing_method == SmoothingMethod.NONE:
+        return NoSmoothing()
+    else:
+        raise ValueError(f"不支持的平滑方法: {config.smoothing_method}")
 
 
 class NGramModel:
@@ -16,23 +118,50 @@ class NGramModel:
     N-Gram 语言模型类
     
     支持计算条件概率 P(w_n | w_{n-(N-1)}, ..., w_{n-1})
-    使用 Add-1 (Laplace) 平滑处理未见的 N-Gram 序列
+    支持多种平滑技术和采样策略
+    
+    Attributes:
+        config: 模型配置
+        n: N-Gram 的阶数
+        vocab: 词汇表
+        vocab_size: 词汇表大小
+        total_tokens: 总词数
+        smoothing: 平滑方法实例
+        logger: 日志记录器
     """
     
-    def __init__(self, n: int = 2):
+    def __init__(
+        self, 
+        config: Optional[ModelConfig] = None,
+        log_config: Optional[LogConfig] = None,
+        n: Optional[int] = None
+    ):
         """
         初始化 N-Gram 模型
         
         Args:
-            n: N-Gram 的阶数，默认为 2 (bigram)
+            config: 模型配置对象，如果提供则忽略 n 参数
+            log_config: 日志配置对象
+            n: N-Gram 的阶数（向后兼容，如果 config 未提供则使用此值）
         """
-        self.n = n
-        self.ngram_counts = defaultdict(Counter)  # n-gram 计数
-        self.context_counts = Counter()  # (n-1)-gram 上下文计数
-        self.vocab = set()  # 词汇表
-        self.vocab_size = 0  # 词汇表大小
-        self.total_tokens = 0  # 总词数
+        if config is not None:
+            self.config = config
+        else:
+            self.config = ModelConfig(n=n if n is not None else 2)
         
+        self.log_config = log_config or LogConfig()
+        self.logger = setup_logger(self.__class__.__name__, self.log_config)
+        
+        self.n = self.config.n
+        self.ngram_counts: Dict[Tuple[str, ...], Counter] = defaultdict(Counter)
+        self.context_counts: Counter = Counter()
+        self.vocab: set = set()
+        self.vocab_size: int = 0
+        self.total_tokens: int = 0
+        self._is_trained: bool = False
+        
+        self.smoothing = get_smoothing_method(self.config)
+    
     def _pad_sentence(self, sentence: List[str]) -> List[str]:
         """
         为句子添加起始和结束标记
@@ -43,7 +172,6 @@ class NGramModel:
         Returns:
             添加标记后的句子
         """
-        # 添加 (n-1) 个 <START> 标记和 1 个 <END> 标记
         padded = ['<START>'] * (self.n - 1) + sentence + ['<END>']
         return padded
     
@@ -53,42 +181,50 @@ class NGramModel:
         
         Args:
             corpus: 语料库，每个元素是一个分词后的句子列表
+            
+        Raises:
+            InvalidInputTypeError: 输入类型错误
+            EmptyCorpusError: 语料库为空
         """
-        print(f"开始训练 {self.n}-Gram 模型...")
-        print(f"语料库包含 {len(corpus)} 个句子")
+        validate_corpus(corpus)
         
-        # 统计词频和 N-Gram
+        self.logger.info(f"开始训练 {self.n}-Gram 模型...")
+        self.logger.info(f"语料库包含 {len(corpus)} 个句子")
+        
+        self.ngram_counts = defaultdict(Counter)
+        self.context_counts = Counter()
+        self.vocab = set()
+        self.total_tokens = 0
+        
         for sentence in corpus:
             padded = self._pad_sentence(sentence)
             self.total_tokens += len(sentence)
             
-            # 更新词汇表
             for word in sentence:
                 self.vocab.add(word)
             self.vocab.add('<END>')
             
-            # 统计 N-Gram
             for i in range(len(padded) - self.n + 1):
                 ngram = tuple(padded[i:i + self.n])
-                context = ngram[:-1]  # (n-1)-gram 上下文
-                word = ngram[-1]  # 当前词
+                context = ngram[:-1]
+                word = ngram[-1]
                 
                 self.ngram_counts[context][word] += 1
                 self.context_counts[context] += 1
         
         self.vocab_size = len(self.vocab)
+        self._is_trained = True
         
-        # 打印训练统计信息
         total_ngrams = sum(len(counts) for counts in self.ngram_counts.values())
-        print(f"词汇表大小: {self.vocab_size}")
-        print(f"总词数: {self.total_tokens}")
-        print(f"不同 {self.n}-Gram 数量: {total_ngrams}")
-        print(f"不同上下文数量: {len(self.context_counts)}")
-        print("训练完成！\n")
+        self.logger.info(f"词汇表大小: {self.vocab_size}")
+        self.logger.info(f"总词数: {self.total_tokens}")
+        self.logger.info(f"不同 {self.n}-Gram 数量: {total_ngrams}")
+        self.logger.info(f"不同上下文数量: {len(self.context_counts)}")
+        self.logger.info("训练完成！")
     
     def _get_probability(self, word: str, context: Tuple[str, ...]) -> float:
         """
-        计算条件概率 P(word | context)，使用 Add-1 平滑
+        计算条件概率 P(word | context)
         
         Args:
             word: 当前词
@@ -96,17 +232,52 @@ class NGramModel:
             
         Returns:
             平滑后的条件概率
+            
+        Raises:
+            ModelNotTrainedError: 模型未训练
         """
-        # Add-1 (Laplace) 平滑
-        # P(w_n | w_{n-(N-1)}, ..., w_{n-1}) = (count(context, w_n) + 1) / (count(context) + |V|)
+        if not self._is_trained:
+            raise ModelNotTrainedError()
         
-        count_context_word = self.ngram_counts[context].get(word, 0)
-        count_context = self.context_counts.get(context, 0)
+        return self.smoothing.calculate_probability(
+            word, context, self.ngram_counts, self.context_counts, self.vocab_size
+        )
+    
+    def _validate_context(self, context: List[str]) -> None:
+        """
+        校验上下文有效性
         
-        # Add-1 平滑公式
-        probability = (count_context_word + 1) / (count_context + self.vocab_size)
+        Args:
+            context: 上下文列表
+            
+        Raises:
+            InvalidInputTypeError: 输入类型错误
+            InvalidContextError: 上下文无效
+        """
+        if not isinstance(context, list):
+            raise InvalidInputTypeError("List[str]", type(context).__name__)
         
-        return probability
+        for i, word in enumerate(context):
+            if not isinstance(word, str):
+                raise InvalidInputTypeError(f"str (位置 {i})", type(word).__name__)
+    
+    def _prepare_context(self, context: List[str]) -> Tuple[str, ...]:
+        """
+        准备上下文元组
+        
+        Args:
+            context: 原始上下文列表
+            
+        Returns:
+            处理后的上下文元组
+        """
+        self._validate_context(context)
+        
+        if len(context) >= self.n - 1:
+            return tuple(context[-(self.n - 1):])
+        else:
+            padded_context = ['<START>'] * (self.n - 1 - len(context)) + context
+            return tuple(padded_context)
     
     def predict_next(self, context: List[str]) -> Tuple[str, float]:
         """
@@ -117,18 +288,18 @@ class NGramModel:
             
         Returns:
             (预测的词, 概率)
+            
+        Raises:
+            ModelNotTrainedError: 模型未训练
+            InvalidInputTypeError: 输入类型错误
         """
-        # 确保上下文长度为 n-1
-        if len(context) >= self.n - 1:
-            context_tuple = tuple(context[-(self.n - 1):])
-        else:
-            # 如果上下文不足，用 <START> 填充
-            padded_context = ['<START>'] * (self.n - 1 - len(context)) + context
-            context_tuple = tuple(padded_context)
+        if not self._is_trained:
+            raise ModelNotTrainedError()
         
-        # 计算所有可能词的概率
+        context_tuple = self._prepare_context(context)
+        
         best_word = None
-        best_prob = -1
+        best_prob = -1.0
         
         for word in self.vocab:
             prob = self._get_probability(word, context_tuple)
@@ -138,20 +309,73 @@ class NGramModel:
         
         return best_word, best_prob
     
-    def generate_text(self, seed: Optional[List[str]] = None, 
-                      max_length: int = 20) -> str:
+    def _greedy_sample(self, context_tuple: Tuple[str, ...]) -> str:
+        """贪婪采样：选择概率最高的词"""
+        best_word = None
+        best_prob = -1.0
+        
+        for word in self.vocab:
+            prob = self._get_probability(word, context_tuple)
+            if prob > best_prob:
+                best_prob = prob
+                best_word = word
+        
+        return best_word
+    
+    def _weighted_random_sample(self, context_tuple: Tuple[str, ...]) -> str:
+        """加权随机采样：按概率分布采样"""
+        words = list(self.vocab)
+        probabilities = [self._get_probability(w, context_tuple) for w in words]
+        
+        total_prob = sum(probabilities)
+        if total_prob == 0:
+            return random.choice(words)
+        
+        probabilities = [p / total_prob for p in probabilities]
+        return random.choices(words, weights=probabilities, k=1)[0]
+    
+    def _get_sampler(self, strategy: SamplingStrategy) -> Callable[[Tuple[str, ...]], str]:
+        """获取采样函数"""
+        if strategy == SamplingStrategy.GREEDY:
+            return self._greedy_sample
+        elif strategy == SamplingStrategy.WEIGHTED_RANDOM:
+            return self._weighted_random_sample
+        else:
+            raise ValueError(f"不支持的采样策略: {strategy}")
+    
+    def generate_text(
+        self, 
+        seed: Optional[List[str]] = None, 
+        max_length: int = 20,
+        sampling_strategy: Optional[SamplingStrategy] = None
+    ) -> str:
         """
         自动生成一段文本
         
         Args:
             seed: 种子文本（可选）
             max_length: 生成文本的最大长度
+            sampling_strategy: 采样策略（贪婪/加权随机）
             
         Returns:
             生成的文本字符串
+            
+        Raises:
+            ModelNotTrainedError: 模型未训练
+            InvalidInputTypeError: 输入类型错误
         """
+        if not self._is_trained:
+            raise ModelNotTrainedError()
+        
+        if seed is not None:
+            self._validate_context(seed)
+        
+        if sampling_strategy is None:
+            sampling_strategy = SamplingStrategy.WEIGHTED_RANDOM
+        
+        sampler = self._get_sampler(sampling_strategy)
+        
         if seed is None:
-            # 从 <START> 标记开始
             context = ['<START>'] * (self.n - 1)
         else:
             context = ['<START>'] * (self.n - 1) + seed
@@ -160,17 +384,7 @@ class NGramModel:
         
         for _ in range(max_length):
             context_tuple = tuple(context[-(self.n - 1):])
-            
-            # 采样下一个词（按概率分布）
-            words = list(self.vocab)
-            probabilities = [self._get_probability(w, context_tuple) for w in words]
-            
-            # 归一化概率
-            total_prob = sum(probabilities)
-            probabilities = [p / total_prob for p in probabilities]
-            
-            # 按概率采样
-            next_word = random.choices(words, weights=probabilities, k=1)[0]
+            next_word = sampler(context_tuple)
             
             if next_word == '<END>':
                 break
@@ -191,7 +405,18 @@ class NGramModel:
             
         Returns:
             困惑度值
+            
+        Raises:
+            ModelNotTrainedError: 模型未训练
+            InvalidInputTypeError: 输入类型错误
+            EmptyCorpusError: 语料库为空
+            DivisionByZeroError: 除零错误
         """
+        if not self._is_trained:
+            raise ModelNotTrainedError()
+        
+        validate_corpus(test_corpus)
+        
         log_prob_sum = 0.0
         total_words = 0
         
@@ -204,276 +429,53 @@ class NGramModel:
                 word = ngram[-1]
                 
                 prob = self._get_probability(word, context)
+                
+                if prob <= 0:
+                    prob = 1e-10
+                
                 log_prob_sum += math.log(prob)
                 total_words += 1
         
-        # 计算困惑度
+        if total_words == 0:
+            raise DivisionByZeroError("测试语料库中没有有效的词")
+        
         avg_log_prob = log_prob_sum / total_words
         perplexity = math.exp(-avg_log_prob)
         
         return perplexity
-
-
-def generate_corpus() -> List[List[str]]:
-    """
-    生成模拟语料库（关于天气和日常对话）
     
-    Returns:
-        分词后的语料库列表
-    """
-    sentences = [
-        # 天气相关
-        "今天天气真好",
-        "阳光明媚适合外出",
-        "天空湛蓝没有云朵",
-        "气温适宜非常舒服",
-        "微风拂面感觉很棒",
-        "天气预报说会下雨",
-        "记得带伞出门",
-        "雨后空气清新",
-        "彩虹出现在天边",
-        "乌云密布快要下雨了",
-        "雷声轰隆大雨倾盆",
-        "雪花飘落冬天来了",
-        "寒风刺骨需要保暖",
-        "霜冻覆盖了草地",
-        "雾气弥漫能见度低",
-        "台风来袭注意安全",
-        "冰雹砸落损坏庄稼",
-        "干旱持续需要灌溉",
-        "洪水泛滥紧急疏散",
-        "地震突发保持冷静",
+    def get_probability_distribution(self, context: List[str]) -> Dict[str, float]:
+        """
+        获取给定上下文下所有词的概率分布
         
-        # 日常对话
-        "早上好你吃了吗",
-        "我刚吃完早餐",
-        "今天工作很忙",
-        "会议持续到下午",
-        "午饭吃什么好呢",
-        "附近有新餐厅",
-        "一起去尝尝吧",
-        "这部电影很好看",
-        "周末有什么安排",
-        "打算去公园散步",
-        "晚上一起看电影",
-        "明天记得带文件",
-        "谢谢你的帮助",
-        "不客气应该的",
-        "最近身体好吗",
-        "一切都很顺利",
-        "祝你生日快乐",
-        "收到你的礼物了",
-        "非常喜欢谢谢你",
-        "好久不见甚是想念",
+        Args:
+            context: 上下文列表
+            
+        Returns:
+            词到概率的映射字典
+            
+        Raises:
+            ModelNotTrainedError: 模型未训练
+        """
+        if not self._is_trained:
+            raise ModelNotTrainedError()
         
-        # 简单故事
-        "从前有座山",
-        "山里有座庙",
-        "庙里有个老和尚",
-        "正在给小和尚讲故事",
-        "故事的内容很有趣",
-        "小和尚听得入迷",
-        "夜幕降临星星出现",
-        "月亮高挂在天空",
-        "小河静静流淌着",
-        "鱼儿在水中游动",
-        "鸟儿归巢休息了",
-        "花儿散发着香气",
-        "小草随风摇摆",
-        "大树提供阴凉",
-        "孩子们在玩耍",
-        "笑声回荡在田野",
-        "农夫辛勤地耕作",
-        "庄稼长得很好",
-        "秋天收获的季节",
-        "果实累累挂满枝头",
-        "冬天雪花纷飞",
-        "大地披上银装",
-        "春天万物复苏",
-        "花朵竞相开放",
-        "夏天绿树成荫",
-        "蝉鸣声声入耳",
-        "小猫在晒太阳",
-        "小狗追着蝴蝶跑",
-        "兔子蹦蹦跳跳",
-        "鸟儿在枝头歌唱",
-        "蜜蜂忙着采蜜",
-        "蝴蝶翩翩起舞",
-        "蜻蜓点水产卵",
-        "青蛙呱呱叫唤",
-        "蚂蚁搬运食物",
-        "蜘蛛织网捕虫",
-        "蜗牛慢慢爬行",
-        "乌龟悠闲散步",
-        "大象体型庞大",
-        "老虎凶猛威武",
-        "猴子活泼好动",
-        "熊猫憨态可掬",
-        "长颈鹿脖子很长",
-        "斑马身上有条纹",
-        "狮子是草原之王",
-        "孔雀开屏美丽",
-        "天鹅优雅高贵",
-        "企鹅摇摇摆摆",
-        "海豚聪明伶俐",
-        "鲸鱼体型巨大",
-        "鲨鱼海洋霸主",
-        "金鱼色彩鲜艳",
-        "乌龟长寿吉祥",
-        "燕子春天归来",
-        "大雁南飞过冬",
-        "喜鹊报喜到来",
-        "乌鸦聪明机智",
-        "鹦鹉学舌有趣",
-        "鸽子象征和平",
-        "老鹰翱翔天空",
-        "猫头鹰夜间活动",
-        "啄木鸟树木医生",
-        "黄莺歌声婉转",
-        "布谷鸟催促播种",
-        "公鸡清晨打鸣",
-        "母鸡下蛋孵小鸡",
-        "鸭子水中嬉戏",
-        "鹅伸长脖子叫",
-        "马儿奔跑迅速",
-        "牛羊吃草悠闲",
-        "猪在泥里打滚",
-        "狗看家护院",
-        "猫捉老鼠厉害",
-        "老鼠偷吃粮食",
-        "蛇冬眠在洞中",
-        "青蛙捉害虫",
-        "壁虎爬墙很快",
-        "蝎子尾巴有毒",
-        "蜈蚣脚很多",
-        "蜘蛛八条腿",
-        "螃蟹横着走路",
-        "虾在水中跳跃",
-        "贝壳藏在沙里",
-        "珊瑚色彩斑斓",
-        "海星五个角",
-        "水母透明漂浮",
-        "章鱼喷墨汁",
-        "乌贼变色伪装",
-        "海马爸爸育儿",
-        "海葵随水流动",
-        "海参软软蠕动",
-        "海胆浑身是刺",
-        "鲍鱼味道鲜美",
-        "扇贝可以食用",
-        "牡蛎营养丰富",
-        "蛤蜊吐沙干净",
-        "螺蛳小小的",
-        "蜗牛背着壳",
-        "蚯蚓松土有益",
-        "蚂蚱跳跃力强",
-        "蟋蟀夜晚鸣叫",
-        "螳螂捕食害虫",
-        "蝉夏天唱歌",
-        "萤火虫发光",
-        "蝴蝶翅膀美丽",
-        "蜜蜂勤劳采蜜",
-        "蚂蚁团结协作",
-        "瓢虫背上有星",
-        "蜻蜓眼睛很大",
-        "蚊子吸血讨厌",
-        "苍蝇传播疾病",
-        "蟑螂生命力强",
-        "飞蛾扑向灯火",
-        "蚕宝宝吐丝",
-        "蝴蝶蜕变成长",
-        "毛毛虫变美丽"
-    ]
-    
-    # 分词（按字符分词，适用于中文）
-    corpus = [list(sentence) for sentence in sentences]
-    
-    return corpus
-
-
-def split_corpus(corpus: List[List[str]], train_ratio: float = 0.8) -> Tuple[List[List[str]], List[List[str]]]:
-    """
-    将语料库划分为训练集和测试集
-    
-    Args:
-        corpus: 完整语料库
-        train_ratio: 训练集比例
+        context_tuple = self._prepare_context(context)
         
-    Returns:
-        (训练集, 测试集)
-    """
-    random.shuffle(corpus)
-    split_idx = int(len(corpus) * train_ratio)
-    train_corpus = corpus[:split_idx]
-    test_corpus = corpus[split_idx:]
-    return train_corpus, test_corpus
-
-
-def main():
-    """主函数"""
-    print("=" * 60)
-    print("N-Gram 语言模型演示")
-    print("=" * 60)
-    
-    # 设置随机种子以保证可重复性
-    random.seed(42)
-    
-    # 生成语料库
-    print("\n【1. 数据生成】")
-    corpus = generate_corpus()
-    print(f"生成语料库共 {len(corpus)} 个句子")
-    print(f"示例句子: {''.join(corpus[0])}")
-    
-    # 划分训练集和测试集
-    train_corpus, test_corpus = split_corpus(corpus, train_ratio=0.8)
-    print(f"训练集: {len(train_corpus)} 个句子")
-    print(f"测试集: {len(test_corpus)} 个句子")
-    
-    # 测试不同的 N 值
-    for n in [2, 3, 4]:
-        print("\n" + "=" * 60)
-        print(f"【{n}-Gram 模型】")
-        print("=" * 60)
+        distribution = {}
+        for word in self.vocab:
+            distribution[word] = self._get_probability(word, context_tuple)
         
-        # 创建并训练模型
-        model = NGramModel(n=n)
-        model.train(train_corpus)
-        
-        # 预测下一个词示例
-        print(f"\n【3. 预测下一个词】")
-        test_contexts = [
-            ["今", "天"],
-            ["天", "气"],
-            ["明", "天"],
-            ["早", "上"]
-        ]
-        
-        for context in test_contexts:
-            next_word, prob = model.predict_next(context)
-            context_str = ''.join(context)
-            print(f"  上下文 '{context_str}' -> 预测: '{next_word}' (概率: {prob:.6f})")
-        
-        # 生成文本
-        print(f"\n【4. 文本生成】")
-        print(f"生成 5 段样本文本（最大长度 15）:")
-        for i in range(5):
-            # 随机选择种子
-            seed = random.choice(train_corpus)[:2] if random.random() > 0.5 else None
-            generated = model.generate_text(seed=seed, max_length=15)
-            print(f"  样本 {i+1}: {generated}")
-        
-        # 计算困惑度
-        print(f"\n【5. 模型评估】")
-        perplexity = model.calculate_perplexity(test_corpus)
-        print(f"测试集困惑度 (Perplexity): {perplexity:.4f}")
-        print(f"解释: 困惑度越低，模型性能越好")
-        print(f"      困惑度为 {perplexity:.2f} 表示模型相当于面对一个")
-        print(f"      有 {perplexity:.2f} 个等概率选择的困惑")
+        return distribution
     
-    print("\n" + "=" * 60)
-    print("演示完成！")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+    def is_trained(self) -> bool:
+        """检查模型是否已训练"""
+        return self._is_trained
+    
+    def get_vocab(self) -> set:
+        """获取词汇表"""
+        return self.vocab.copy()
+    
+    def get_vocab_size(self) -> int:
+        """获取词汇表大小"""
+        return self.vocab_size
